@@ -7,7 +7,15 @@ authors = [
     { name = "lukasz", email = "lwasik2602@gmail.com" }
 ]
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "httpx>=0.28.1",
+    "numpy>=2.5.4",
+    "pandas>=3.1.1",
+    "psycopg[binary]>=3.3.9",
+    "pydantic-settings>=2.16.2",
+    "scikit-learn>=1.9.1",
+    "sqlalchemy>=2.1.8",
+]
 
 [project.scripts]
 air-quality-ml = "air_quality_ml:main"
@@ -15,3 +23,35 @@ air-quality-ml = "air_quality_ml:main"
 [build-system]
 requires = ["uv_build>=0.13.8,<0.14.0"]
 build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.4.0",
+    "jupyterlab>=4.6.6",
+    "pytest>=9.2.0",
+    "ruff>=0.17.5",
+]
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+src = ["src"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "F",    # Pyflakes
+    "I",    # isort - import sorting
+    "B",    # flake8-bugbear
+    "UP",   # pyupgrade
+]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "auto"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-ra"
