@@ -15,6 +15,11 @@ venv/
 .env
 .env.*
 
+# Ignoruj pliki danych i bazy
+*.csv
+*.parquet
+data/
+*.db
 # Cache and test artifacts
 .pytest_cache/
 .ruff_cache/
