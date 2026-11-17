@@ -3,23 +3,34 @@ services:
     image: postgis/postgis:17-3.5
     container_name: air-quality-postgres
     restart: unless-stopped
-
     environment:
       POSTGRES_DB: ${POSTGRES_DB}
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-
     ports:
       - "127.0.0.1:5432:5432"
-
     volumes:
       - postgres_data:/var/lib/postgresql/data
-
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
       interval: 10s
       timeout: 5s
       retries: 5
+
+  # Nasz automatyczny worker wykonujący scheduler
+  etl-worker:
+    build: .
+    container_name: air-quality-worker
+    restart: unless-stopped
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_HOST=postgres  # <-- Zmieniono z DB_HOST na POSTGRES_HOST
+      - POSTGRES_PORT=5432
+    depends_on:
+      postgres:
+        condition: service_healthy
 
 volumes:
   postgres_data:
