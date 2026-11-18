@@ -108,11 +108,43 @@ def init_db() -> None:
                               value REAL
                               );
                           """))
+        conn.execute(text("""
+                          CREATE TABLE IF NOT EXISTS meteo_measurements
+                          (
+                              id
+                              SERIAL
+                              PRIMARY
+                              KEY,
+                              station_id
+                              INT
+                              REFERENCES
+                              stations
+                          (
+                              station_id
+                          ) ON DELETE CASCADE,
+                              datetime TIMESTAMP NOT NULL,
+                              temperature_2m REAL,
+                              relative_humidity_2m REAL,
+                              dew_point_2m REAL,
+                              surface_pressure REAL,
+                              wind_speed_10m REAL,
+                              wind_direction_10m REAL,
+                              wind_gusts_10m REAL,
+                              precipitation REAL,
+                              cloud_cover REAL,
+                              boundary_layer_height REAL,
+                              shortwave_radiation REAL
+                              );
+                          """))
 
         # 5. Kluczowy indeks unikalny dla mechanizmu UPSERT oraz przyspieszenia zapytań
         conn.execute(text("""
                           CREATE UNIQUE INDEX IF NOT EXISTS idx_measurements_sensor_datetime
                               ON measurements(sensor_id, datetime);
+                          """))
+        conn.execute(text("""
+                          CREATE UNIQUE INDEX IF NOT EXISTS idx_meteo_station_datetime
+                              ON meteo_measurements(station_id, datetime);
                           """))
 
     print("Struktura bazy danych została pomyślnie skonfigurowana!")

@@ -20,6 +20,8 @@ services:
   # Nasz automatyczny worker wykonujący scheduler
   etl-worker:
     build: .
+    volumes:
+      - ./data:/app/data
     container_name: air-quality-worker
     restart: unless-stopped
     environment:
