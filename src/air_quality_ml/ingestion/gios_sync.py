@@ -1,75 +1,63 @@
 import asyncio
-from datetime import datetime
+import calendar
+from datetime import datetime, timedelta
 from pathlib import Path
 import httpx
 import pandas as pd
 from sqlalchemy import text
-from air_quality_ml.database import engine
 from tqdm.asyncio import tqdm
-
-GIOS_API_URL = "https://api.gios.gov.pl/pjp-api/v1/rest"
-
-TARGET_VOIVODESHIPS = [
-    "PODKARPACKIE",
-    "MAŁOPOLSKIE",
-    "LUBELSKIE",
-    "ŚWIĘTOKRZYSKIE",
-]
+from air_quality_ml.database import engine
+from air_quality_ml.ingestion.stations_sync import (
+    GIOS_API_URL,
+    fetch_json,
+    sync_stations_and_sensors,
+)
 
 SEMAPHORE_LIMIT = 5
 
 
-async def fetch_json(client: httpx.AsyncClient, url: str, params: dict = None) -> dict | list | None:
-    try:
-        response = await client.get(url, params=params, timeout=45)
-        response.raise_for_status()
-        return response.json()
-    except (httpx.HTTPStatusError, httpx.HTTPError):
-        return None
+def iter_month_windows(start_dt: datetime, end_dt: datetime):
+    """Generuje pary (month_from, month_to) w paczkach po 1 miesiącu."""
+    current = datetime(start_dt.year, start_dt.month, 1, 0, 0)
+    while current <= end_dt:
+        last_day = calendar.monthrange(current.year, current.month)[1]
+        month_start = current if current >= start_dt else start_dt
+        month_end = datetime(current.year, current.month, last_day, 23, 59)
+        if month_end > end_dt:
+            month_end = end_dt
+
+        if month_start <= month_end:
+            yield month_start, month_end
+
+        if current.month == 12:
+            current = datetime(current.year + 1, 1, 1, 0, 0)
+        else:
+            current = datetime(current.year, current.month + 1, 1, 0, 0)
 
 
-async def get_all_stations(client: httpx.AsyncClient) -> list[dict]:
-    url = f"{GIOS_API_URL}/station/findAll"
-    data = await fetch_json(client, url, params={"size": 1000})
-    if not data:
-        return []
-
-    stations = data.get("Lista stacji pomiarowych", [])
-    filtered = []
-    for s in stations:
-        voivodeship = s.get("Województwo", "").strip().upper()
-        if any(target in voivodeship for target in TARGET_VOIVODESHIPS):
-            filtered.append(s)
-    return filtered
-
-
-async def get_sensors(client: httpx.AsyncClient, station_id: int) -> list[dict]:
-    url = f"{GIOS_API_URL}/station/sensors/{station_id}"
-    data = await fetch_json(client, url, params={"size": 100})
-    if not data:
-        return []
-    return data.get("Lista stanowisk pomiarowych dla podanej stacji", [])
-
-
-def get_sensor_watermarks() -> dict[int, str]:
-    watermarks = {}
+def get_sensor_watermarks() -> dict[int, datetime]:
+    watermarks: dict[int, datetime] = {}
     try:
         with engine.begin() as conn:
             result = conn.execute(text("""
-                                       SELECT sensor_id, MAX(datetime) as max_date
-                                       FROM measurements
-                                       GROUP BY sensor_id;
-                                       """))
+                SELECT sensor_id, MAX(datetime) AS max_date
+                FROM measurements
+                GROUP BY sensor_id;
+            """))
             for row in result:
                 if row.max_date:
-                    watermarks[row.sensor_id] = row.max_date.strftime("%Y-%m-%d %H:%M")
+                    watermarks[int(row.sensor_id)] = row.max_date
     except Exception as e:
         print(f"Błąd odczytu wodoznaków z bazy: {e}")
     return watermarks
 
 
-async def get_archival_data_incremental(
-        client: httpx.AsyncClient, sensor_id: int, date_from: str, date_to: str, semaphore: asyncio.Semaphore
+async def get_archival_data_for_window(
+    client: httpx.AsyncClient,
+    sensor_id: int,
+    date_from: str,
+    date_to: str,
+    semaphore: asyncio.Semaphore,
 ) -> list[dict]:
     url = f"{GIOS_API_URL}/archivalData/getDataBySensor/{sensor_id}"
     all_measurements = []
@@ -102,88 +90,153 @@ async def get_archival_data_incremental(
     return all_measurements
 
 
-def save_to_raw_landing_zone(df: pd.DataFrame) -> Path:
+def save_to_raw_landing_zone(df: pd.DataFrame, tag: str = "measurements") -> Path:
     now = datetime.now()
     dir_path = Path("data") / "raw" / f"{now.year:04d}" / f"{now.month:02d}" / f"{now.day:02d}"
     dir_path.mkdir(parents=True, exist_ok=True)
 
-    file_path = dir_path / f"measurements_{now.strftime('%H%M%S')}.parquet"
+    file_path = dir_path / f"{tag}_{now.strftime('%H%M%S_%f')}.parquet"
     df.to_parquet(file_path, index=False)
-    print(f"Zapisano surowy backup do: {file_path}")
     return file_path
 
 
-def upsert_measurements_to_db(df: pd.DataFrame) -> None:
+def upsert_measurements_to_db(df: pd.DataFrame) -> int:
     if df.empty:
-        return
+        return 0
 
-    print("Zapisywanie danych do bazy PostgreSQL (UPSERT)...")
     records = df[["sensor_id", "datetime", "value"]].to_dict(orient="records")
-
     sql = text("""
-               INSERT INTO measurements (sensor_id, datetime, value)
-               VALUES (:sensor_id, :datetime, :value) ON CONFLICT (sensor_id, datetime) 
-        DO
-               UPDATE SET value = EXCLUDED.value;
-               """)
+        INSERT INTO measurements (sensor_id, datetime, value)
+        VALUES (:sensor_id, :datetime, :value)
+        ON CONFLICT (sensor_id, datetime)
+        DO UPDATE SET value = EXCLUDED.value;
+    """)
 
     with engine.begin() as conn:
         conn.execute(sql, records)
 
-    print(f"Pomyślnie zsynchronizowano {len(records)} rekordów w bazie!")
+    return len(records)
+
+
+async def _sync_date_range(
+    client: httpx.AsyncClient,
+    sensor_ids: list[int],
+    date_from_dt: datetime,
+    date_to_dt: datetime,
+    semaphore: asyncio.Semaphore,
+    label: str,
+) -> int:
+    date_from_str = date_from_dt.strftime("%Y-%m-%d %H:%M")
+    date_to_str = date_to_dt.strftime("%Y-%m-%d %H:%M")
+
+    tasks = [
+        get_archival_data_for_window(client, s_id, date_from_str, date_to_str, semaphore)
+        for s_id in sensor_ids
+    ]
+    results = await tqdm.gather(*tasks, desc=f"GIOŚ {label}", leave=False)
+
+    all_records = []
+    for s_id, measurements in zip(sensor_ids, results):
+        for m in measurements:
+            all_records.append({
+                "sensor_id": s_id,
+                "datetime": m.get("Data"),
+                "value": m.get("Wartość"),
+            })
+
+    if not all_records:
+        print(f"[{label}] Pobrano 0 rekordów.")
+        return 0
+
+    df = pd.DataFrame(all_records)
+    df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+    df = df.dropna(subset=["datetime"])
+    df = df.drop_duplicates(subset=["sensor_id", "datetime"]).reset_index(drop=True)
+
+    parquet_path = save_to_raw_landing_zone(df, tag=f"gios_{label}")
+    synced = upsert_measurements_to_db(df)
+    print(f"[{label}] Pobrano i zsynchronizowano {synced} rekordów (backup: {parquet_path.name}).")
+    return synced
+
+
+async def run_history_backfill_months(months_back: int = 60, end_dt: datetime | None = None) -> None:
+    """Dociąga dane historyczne (domyślnie ~5 lat = 60 miesięcy) paczkami po 1 miesiącu."""
+    print(f"--- START BACKFILLU GIOŚ (ostatnie {months_back} mies., paczki po 1 mies.) ---")
+    stations, sensors_by_station = await sync_stations_and_sensors()
+    if not stations:
+        print("Brak stacji do pobrania.")
+        return
+
+    sensor_ids = [
+        int(sensor["Identyfikator stanowiska"])
+        for sens_list in sensors_by_station.values()
+        for sensor in sens_list
+        if sensor.get("Identyfikator stanowiska") is not None
+    ]
+
+    now = end_dt or datetime.now()
+    # Przybliżone cofnięcie o months_back miesięcy od początku bieżącego miesiąca
+    total_months = now.year * 12 + (now.month - 1) - months_back
+    start_year = total_months // 12
+    start_month = (total_months % 12) + 1
+    start_dt = datetime(start_year, start_month, 1, 0, 0)
+
+    limits = httpx.Limits(max_keepalive_connections=10, max_connections=20)
+    semaphore = asyncio.Semaphore(SEMAPHORE_LIMIT)
+
+    total_synced = 0
+    async with httpx.AsyncClient(limits=limits, timeout=60) as client:
+        for m_from, m_to in iter_month_windows(start_dt, now):
+            label = m_from.strftime("%Y-%m")
+            synced = await _sync_date_range(client, sensor_ids, m_from, m_to, semaphore, label)
+            total_synced += synced
+
+    print(f"--- KONIEC BACKFILLU GIOŚ (łącznie zsynchronizowano: {total_synced} rekordów) ---")
 
 
 async def run_incremental_sync() -> None:
-    """Główna funkcja orkiestrująca pobieranie przyrostowe GIOŚ."""
+    """Lekki tryb przyrostowy dla schedulera co godzinę."""
     print("--- START PRZYROSTOWEGO PROCESU ETL GIOŚ ---")
+    stations, sensors_by_station = await sync_stations_and_sensors()
+    if not stations:
+        return
 
     watermarks = get_sensor_watermarks()
-    default_date_from = "2026-01-01 00:00"
-    date_to = datetime.now().strftime("%Y-%m-%d %H:%M")
+    now = datetime.now()
+    default_from = now - timedelta(hours=48)
+    date_to_str = now.strftime("%Y-%m-%d %H:%M")
 
     limits = httpx.Limits(max_keepalive_connections=10, max_connections=20)
     semaphore = asyncio.Semaphore(SEMAPHORE_LIMIT)
 
     async with httpx.AsyncClient(limits=limits, timeout=60) as client:
-        print("Pobieranie listy stacji...")
-        stations = await get_all_stations(client)
-        print(f"Znaleziono {len(stations)} stacji.")
-
-        if not stations:
-            return
-
-        print("Pobieranie sensorów dla stacji...")
-        station_sensor_tasks = [get_sensors(client, s.get("Identyfikator stacji")) for s in stations]
-        sensors_results = await asyncio.gather(*station_sensor_tasks)
-
-        download_tasks = []
-        task_metadata = []
-
-        for station, sensors in zip(stations, sensors_results):
-            s_id = station.get("Identyfikator stacji")
-            s_name = station.get("Nazwa stacji")
-            voivodeship = station.get("Województwo")
-
-            for sensor in sensors:
-                sensor_id = sensor.get("Identyfikator stanowiska")
-                indicator = sensor.get("Wskaźnik")
-                if sensor_id is not None:
-                    date_from = watermarks.get(sensor_id, default_date_from)
-                    download_tasks.append(
-                        get_archival_data_incremental(client, sensor_id, date_from, date_to, semaphore)
+        tasks = []
+        task_ids = []
+        for sens_list in sensors_by_station.values():
+            for sensor in sens_list:
+                s_id = sensor.get("Identyfikator stanowiska")
+                if s_id is None:
+                    continue
+                sensor_id = int(s_id)
+                wm = watermarks.get(sensor_id)
+                # Mały zakładnik 2h wstecz na wypadek opóźnionych pomiarów
+                from_dt = (wm - timedelta(hours=2)) if wm else default_from
+                if from_dt <= now:
+                    tasks.append(
+                        get_archival_data_for_window(
+                            client, sensor_id, from_dt.strftime("%Y-%m-%d %H:%M"), date_to_str, semaphore
+                        )
                     )
-                    task_metadata.append({
-                        "sensor_id": sensor_id,
-                    })
+                    task_ids.append(sensor_id)
 
-        print(f"Pobieranie nowych pomiarów dla {len(download_tasks)} sensorów...")
-        measurements_results = await tqdm.gather(*download_tasks, desc="Pobieranie sensorów")
+        print(f"Pobieranie nowych pomiarów dla {len(tasks)} sensorów...")
+        results = await tqdm.gather(*tasks, desc="Pobieranie sensorów")
 
         all_records = []
-        for meta, measurements in zip(task_metadata, measurements_results):
+        for sensor_id, measurements in zip(task_ids, results):
             for m in measurements:
                 all_records.append({
-                    "sensor_id": meta["sensor_id"],
+                    "sensor_id": sensor_id,
                     "datetime": m.get("Data"),
                     "value": m.get("Wartość"),
                 })
@@ -193,11 +246,11 @@ async def run_incremental_sync() -> None:
         return
 
     df = pd.DataFrame(all_records)
-    df["datetime"] = pd.to_datetime(df["datetime"])
+    df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+    df = df.dropna(subset=["datetime"])
     df = df.drop_duplicates(subset=["sensor_id", "datetime"]).reset_index(drop=True)
 
     print(f"Pobrano łącznie {len(df)} nowych/zaktualizowanych rekordów.")
-
     save_to_raw_landing_zone(df)
     upsert_measurements_to_db(df)
     print("--- KONIEC PROCESU ETL ---")
